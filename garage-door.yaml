@@ -69,12 +69,20 @@ binary_sensor:
                   format: "Hardwired button being pressed"
                   tag: garage_door
                   level: WARN
+
     on_release:
       then:
-        - logger.log:
-            format: "Hardwired button released"
-            tag: garage_door
-            level: WARN
+        - if:
+            condition:
+              lambda: 'return id(is_processing) == false;'
+            then:
+              - logger.log:
+                  format: "Hardwired button being released"
+                  tag: garage_door
+                  level: WARN
+
+              - script.execute: button_pushed_manually
+
     filters:
       - delayed_on: !lambda 'return id(garage_button_press_threshold).state;' # Only register as 'pressed' if held for more than 200ms
 
@@ -89,6 +97,7 @@ number:
     unit_of_measurement: "s"
     initial_value: 20.0
     optimistic: true
+    restore_value: true
   - platform: template
     name: "Open Time"
     icon: mdi:arrow-up
@@ -99,9 +108,10 @@ number:
     unit_of_measurement: "s"
     initial_value: 15.5
     optimistic: true
+    restore_value: true
   - platform: template
     name: "Button press threshold" # How long a press must be in order to be registered by the garage door opener. (Used to keep track of valid manual user input).
-    icon: mdi:timer-outline
+    icon: mdi:gesture-tap-button
     id: garage_button_press_threshold
     min_value: 50
     max_value: 1000
@@ -109,9 +119,10 @@ number:
     unit_of_measurement: "ms"
     initial_value: 400
     optimistic: true
+    restore_value: true
   - platform: template
     name: "Button press duration" # How long the controller should press the garage door opener before releasing it
-    icon: mdi:gesture-tap-button
+    icon: mdi:button-cursor
     id: garage_button_press_duration
     min_value: 50
     max_value: 1000
@@ -119,6 +130,7 @@ number:
     unit_of_measurement: "ms"
     initial_value: 500
     optimistic: true
+    restore_value: true
 
 globals:
   - id: door_state
@@ -154,6 +166,92 @@ globals:
     initial_value: 'false'
 
 script:
+  - id: button_pushed_manually
+    mode: single
+    then:
+        # Door is closed
+        - if:
+            condition:
+              lambda: 'return id(door_state) == 0;' # Closed
+            then:
+              - lambda: 'id(door_state) = 2;' # Opening
+              - lambda: 'id(desired_position) = 100.0;'
+
+              - cover.template.publish: 
+                  id: garage_door
+                  position: !lambda 'return id(door_position) / 100.0;'
+                  current_operation: OPENING
+            else:
+                # Door is open
+                - if:
+                    condition:
+                      lambda: 'return id(door_state) == 1;' # Open
+                    then:
+                      - lambda: 'id(door_state) = 3;' # Closing
+                      - lambda: 'id(desired_position) = 0.0;'
+
+                      - cover.template.publish: 
+                          id: garage_door
+                          position: !lambda 'return id(door_position) / 100.0;'
+                          current_operation: CLOSING
+                    else:
+                        # Door is opening
+                        - if:
+                            condition:
+                              lambda: 'return id(door_state) == 2;' # Opening
+                            then:
+                              - lambda: 'id(door_state) = 4;' # Intermediary
+                              - lambda: 'id(next_direction) = 3;' # Closing
+
+                                # Publish the new position
+                              - cover.template.publish: 
+                                  id: garage_door
+                                  position: !lambda 'return id(door_position) / 100.0;'
+                                  current_operation: IDLE
+                            else:
+                                # Door is closing
+                                - if:
+                                    condition:
+                                      lambda: 'return id(door_state) == 3;' # Closing
+                                    then:
+                                      - lambda: 'id(door_state) = 4;' # Intermediary
+                                      - lambda: 'id(next_direction) = 2;' # Opening
+
+                                        # Publish the new position
+                                      - cover.template.publish: 
+                                          id: garage_door
+                                          position: !lambda 'return id(door_position) / 100.0;'
+                                          current_operation: IDLE
+                                    else:
+                                        # Door is intermediate
+                                        - if:
+                                            condition:
+                                              lambda: 'return id(door_state) == 4;' # Intermediate
+                                            then:
+                                              - if:
+                                                  condition:
+                                                    lambda: 'return id(next_direction) == 2;' # Opening
+                                                  then:
+                                                    - lambda: 'id(door_state) = 2;' # Opening
+
+                                                    # Publish the new position
+                                                    - cover.template.publish: 
+                                                        id: garage_door
+                                                        position: !lambda 'return id(door_position) / 100.0;'
+                                                        current_operation: OPENING
+
+                                              - if:
+                                                  condition:
+                                                    lambda: 'return id(next_direction) == 3;' # Closing
+                                                  then:
+                                                    - lambda: 'id(door_state) = 3;' # Closing
+
+                                                    # Publish the new position
+                                                    - cover.template.publish: 
+                                                        id: garage_door
+                                                        position: !lambda 'return id(door_position) / 100.0;'
+                                                        current_operation: CLOSING
+
   # We need to queue the actions sequentially, so that mashing the buttons doesn't mess everything up
   - id: process_queue
     mode: queued
@@ -557,4 +655,4 @@ cover:
 
 # TODO:
 # 3. Det er av og til den 'publishing position: 0%', sjølv om den før og etter seier at den er rundt td. 60%. Det er også ein del tilfeller der den seier 'setting: 0%', men det er kanskje meininga
-# 6. Overvåk manuell user-input (bruk av brytaren på veggen ol)
+# 11. The hardwired button is triggered by the software button in some scenarios... maybe add a grace period
