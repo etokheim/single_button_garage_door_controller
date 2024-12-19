@@ -1,0 +1,404 @@
+esphome:
+  name: garage-door
+  friendly_name: Garage Door
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+  level: VERBOSE
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret home_assistant_api_key
+
+ota:
+  - platform: esphome
+    password: !secret garage_door_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  manual_ip:
+    static_ip: !secret garage_door_ip
+    gateway: !secret gateway
+    subnet: !secret subnet_mask
+    dns1: !secret dns_server
+
+switch:
+  - platform: gpio
+    pin: GPIO27
+    internal: True
+    id: garage_door_switch
+    inverted: yes
+    
+button:
+  - platform: template
+    name: "Reset garage door (to closed)"
+    on_press:
+      then:
+        - logger.log: Button press to reset the garage door's position
+        - lambda: id(door_position) = 0.0;
+        - cover.template.publish:
+            id: garage_door
+            position: !lambda 'return id(door_position) / 100.0;'
+            current_operation: IDLE
+        - lambda: 'id(door_state) = 0;' # Closed
+
+globals:
+  - id: door_state
+    type: int
+    restore_value: true
+    initial_value: '0'  # 0: Closed, 1: Open, 2: Opening, 3: Closing, 4: Intermediary (stopped when neither fully open or closed)
+  - id: next_direction
+    type: int
+    restore_value: true
+    initial_value: '-1'  # -1: Unknown, 2: Opening, 3: Closing
+  - id: door_position
+    type: float
+    restore_value: true
+    initial_value: '0.0'  # Position in percentage (0.0 to 100.0)
+  - id: start_position
+    type: float
+    restore_value: true
+    initial_value: '0.0'  # Position in percentage (0.0 to 100.0)
+  - id: garage_door_close_time
+    type: float
+    restore_value: true
+    initial_value: '15.5' # The time it takes for the door to move from fully open to the closed
+  - id: garage_door_open_time
+    type: float
+    restore_value: true
+    initial_value: '20.0' # The time it takes for the door to move from fully closed to the open
+  - id: garage_door_button_press_duration
+    type: int
+    restore_value: true
+    initial_value: '500' # For how long the button should be pressed
+  - id: desired_position
+    type: float
+    restore_value: true
+    initial_value: '0.0' # For how long the button should be pressed
+
+script:
+  - id: push_button
+    mode: queued
+    then:
+      - switch.turn_on: garage_door_switch
+      - delay: !lambda 'return id(garage_door_button_press_duration);'
+      - switch.turn_off: garage_door_switch
+
+  - id: move_up
+    mode: queued
+    then:
+      - lambda: 'id(start_position) = id(door_position);'
+
+      # Door is closed
+      - if:
+          condition:
+            lambda: 'return id(door_state) == 0;' # Closed
+          then:
+            - lambda: 'id(door_state) = 2;' # Opening
+            - script.execute: push_button
+            - script.wait: push_button
+          
+          else:
+            # Else, if door is closing
+            - if:
+                condition:
+                  lambda: 'return id(door_state) == 3;' # Closing
+                then:
+                    # Publish the new position
+                  - cover.template.publish: 
+                      id: garage_door
+                      position: !lambda 'return id(door_position) / 100.0;'
+                      current_operation: OPENING
+
+                  - script.execute: push_button
+                  - script.wait: push_button
+                  - lambda: 'id(door_state) = 4;' # Intermediary
+
+                  - delay: !lambda 'return id(garage_door_button_press_duration);'
+
+                  - script.execute: push_button
+                  - script.wait: push_button
+                  - lambda: 'id(door_state) = 2;' # Opening
+
+            # Else, if door is intermediate
+            - if:
+                condition:
+                  lambda: 'return id(door_state) == 4;' # Intermediary
+                then:
+                  - if:
+                      condition:
+                        lambda: 'return id(next_direction) == 2;' # Closing
+                      then:
+                          # Publish the new position
+                        - cover.template.publish: 
+                            id: garage_door
+                            position: !lambda 'return id(door_position) / 100.0;'
+                            current_operation: OPENING
+                            
+                        - script.execute: push_button
+                        - script.wait: push_button
+
+                        - lambda: 'id(door_state) = 2;' # Opening
+                
+                  - if:
+                      condition:
+                        lambda: 'return id(next_direction) == 3;' # Closing
+                      then:
+                          # Publish the new operation
+                        - cover.template.publish: 
+                            id: garage_door
+                            position: !lambda 'return id(door_position) / 100.0;'
+                            current_operation: OPENING
+
+                        - script.execute: push_button
+                        - script.wait: push_button
+
+                        - lambda: 'id(door_state) = 3;' # Closing
+                        - delay: !lambda 'return id(garage_door_button_press_duration);'
+                        
+                        - script.execute: push_button
+                        - script.wait: push_button
+                        
+                        - lambda: 'id(door_state) = 4;' # Intermediary
+                        - delay: !lambda 'return id(garage_door_button_press_duration);'
+                        
+                        - script.execute: push_button
+                        - script.wait: push_button
+
+                        - lambda: 'id(door_state) = 2;' # Opening
+
+  - id: move_down
+    mode: queued
+    then:
+      - lambda: 'id(start_position) = id(door_position);'
+
+      # Door is open
+      - if:
+          condition:
+            lambda: 'return id(door_state) == 1;' # Open
+          then:
+            - lambda: 'id(door_state) = 3;' # Closing
+            - script.execute: push_button
+            - script.wait: push_button
+          
+          else:
+            # Else, if door is opening
+            - if:
+                condition:
+                  lambda: 'return id(door_state) == 2;' # Opening
+                then:
+                    # Publish the new position
+                  - cover.template.publish: 
+                      id: garage_door
+                      position: !lambda 'return id(door_position) / 100.0;'
+                      current_operation: CLOSING
+
+                  - script.execute: push_button
+                  - script.wait: push_button
+
+                  - lambda: 'id(door_state) = 4;' # Intermediary
+                  - delay: !lambda 'return id(garage_door_button_press_duration);'
+
+                  - script.execute: push_button
+                  - script.wait: push_button
+                  - lambda: 'id(door_state) = 3;' # Closing
+
+            # Else, if door is intermediate
+            - if:
+                condition:
+                  lambda: 'return id(door_state) == 4;' # Intermediary
+                then:
+                  - if:
+                      condition:
+                        lambda: 'return id(next_direction) == 3;' # Closing
+                      then:
+                          # Publish the new operation
+                        - cover.template.publish:
+                            id: garage_door
+                            position: !lambda 'return id(door_position) / 100.0;'
+                            current_operation: CLOSING
+
+                        - lambda: 'id(door_state) = 4;' # Intermediary
+                        - script.execute: push_button
+                        - script.wait: push_button
+
+                        - lambda: 'id(door_state) = 3;' # Closing
+                      
+                  - if:
+                      condition:
+                        lambda: 'return id(next_direction) == 2;' # Opening
+                      then:
+                          # Publish the new operation
+                        - cover.template.publish:
+                            id: garage_door
+                            position: !lambda 'return id(door_position) / 100.0;'
+                            current_operation: CLOSING
+
+                        - script.execute: push_button
+                        - script.wait: push_button
+
+                        - lambda: 'id(door_state) = 2;' # Opening
+                        - delay: !lambda 'return id(garage_door_button_press_duration);'
+
+                        - script.execute: push_button
+                        - script.wait: push_button
+
+                        - lambda: 'id(door_state) = 4;' # Intermediary (stop)
+                        - delay: !lambda 'return id(garage_door_button_press_duration);'
+
+                        - script.execute: push_button
+                        - script.wait: push_button
+
+                        - lambda: 'id(door_state) = 3;' # Closing
+
+interval:
+  - interval: 250ms
+    then:
+      - if:
+          condition:
+            # Only publish new state every second if the door is moving
+            lambda: 'return id(door_state) == 2 || id(door_state) == 3;'
+          then:
+            - lambda: |-
+                int direction = (id(door_state) == 2) ? 1 : (id(door_state) == 3) ? -1 : 0;
+                ESP_LOGD("debug", "direction: %d (1: opening, -1: closing)", direction);
+
+                // Throw an error if the direction is 0 (shouldn't be possible)
+                if (abs(direction) == 0) {
+                  ESP_LOGE("garage_door", "Invalid door_state: %d. Expected 2 (opening) or 3 (closing).", id(door_state));
+                  return;
+                }
+
+                // Add/subtract as many percent as the door moves in a n-time to the position
+                if (direction == 1) { // Opening
+                  //                                                         1s   / interval time
+                  id(door_position) += 100.0 / id(garage_door_open_time) / (1000 / 250) * direction;
+                } else { // Closing
+                  id(door_position) += 100.0 / id(garage_door_close_time) / (1000 / 250) * direction;
+                }
+                
+                ESP_LOGD("debug", "Desired position: %f", id(desired_position));
+                ESP_LOGD("debug", "Direction: %d", direction);
+                ESP_LOGD("debug", "Door position: %f", id(door_position));
+                ESP_LOGD("debug", "Start position: %f", id(start_position));
+
+                // If opening
+                // and we're ultimately going in the opening direction (if the door has to turn, it has to briefly go in the wrong direction)
+                if (direction == 1 && id(start_position) <= id(desired_position)) {
+                  // Keep going until door_position is higher than the desired position.
+                  // Also, don't do anything if the desired_position is 100 (the door stops automatically when reaching the end)
+                  if (id(door_position) >= id(desired_position) && id(desired_position) < 100) {
+                    id(door_state) = 4;         // Stop moving and set to intermediate (If fully open/closed the state is fixed below)
+                    id(push_button)->execute();
+                    // return id(push_button)->wait(); // Cant be used in a lambda, as it would block all functioning of the device
+                    id(next_direction) = 3; // Closing
+                    
+                    ESP_LOGD("debug", "While opening, the door reached the desired position (%f) and stopped at %f. Start position: %f", id(desired_position), id(door_position), id(start_position));
+                  }
+                } else if (direction == -1 && id(start_position) >= id(desired_position)) { // Closing
+                  if (id(door_position) <= id(desired_position) && id(desired_position) > 0) {
+                    id(door_state) = 4;         // Stop moving and set to intermediate (If fully open/closed the state is fixed below)
+                    id(push_button)->execute();
+                    // return id(push_button)->wait(); // Cant be used in a lambda, as it would block all functioning of the device
+                    id(next_direction) = 2; // Opening
+                    
+                    ESP_LOGD("debug", "While closing, the door reached the desired position (%f) and stopped at %f. Start position: %f", id(desired_position), id(door_position), id(start_position));
+                  }
+                }
+                
+                // Clamp overshooting percentages to 100 or 0
+                if (id(door_position) >= 100.0) {
+                  id(door_position) = 100.0;  // Fully open
+                  id(door_state) = 1;         // Mark as open
+                } else if (id(door_position) <= 0.0) {
+                  id(door_position) = 0.0;    // Fully closed
+                  id(door_state) = 0;         // Mark as closed
+                }
+
+            # Publish the new position
+            - cover.template.publish:
+                id: garage_door
+                position: !lambda 'return id(door_position) / 100.0;'
+                current_operation: !lambda |-
+                  if (id(door_state) == 2) {
+                    return CoverOperation::COVER_OPERATION_OPENING;
+                  } else if (id(door_state) == 3) {
+                    return CoverOperation::COVER_OPERATION_CLOSING;
+                  } else {
+                    return CoverOperation::COVER_OPERATION_IDLE;
+                  }
+
+cover:
+  - platform: template
+    name: "Garage Door"
+    id: garage_door
+    optimistic: false
+    has_position: true
+    position_action:
+      - lambda:  |-
+          id(desired_position) = pos * 100;
+          ESP_LOGD("debug", "Desired position: %f", id(desired_position));
+
+      # If we should go up
+      - if:
+          condition:
+            lambda: 'return id(desired_position) > id(door_position);'
+          then:
+            - script.execute: move_up
+            - script.wait: move_up
+          
+          else:
+            # Else, if we should go down
+            - if:
+                condition:
+                  lambda: 'return id(desired_position) < id(door_position);'
+                then:
+                  - script.execute: move_down
+                  - script.wait: move_down
+
+
+    open_action:
+      - lambda: 'id(desired_position) = 100.0;'
+      - script.execute: move_up
+      
+
+    close_action:
+      - lambda: 'id(desired_position) = 0.0;'
+      - script.execute: move_down
+
+    stop_action:
+      - if:
+          condition:
+            lambda: 'return id(door_state) == 2 || id(door_state) == 3; // Opening or closing'
+          then:
+            - script.execute: push_button
+            - script.wait: push_button
+            - lambda: |-
+                // If it was opening, set next_direction to closing, else the opposite
+                if (id(door_state) == 2) { // Opening
+                  id(next_direction) = 3; // Closing
+                } else if (id(door_state) == 3) { // Closing
+                  id(next_direction) = 2; // Opening
+                }
+                
+                id(door_state) = 4;
+
+            # Publish the new operation
+            - cover.template.publish: 
+                id: garage_door
+                position: !lambda 'return id(door_position) / 100.0;'
+                current_operation: IDLE
+
+
+# TODO:
+# 3. Det er av og til den 'publishing position: 0%', sjølv om den før og etter seier at den er rundt td. 60%. Det er også ein del tilfeller der den seier 'setting: 0%', men det er kanskje meininga
+# 6. Overvåk manuell user-input (bruk av brytaren på veggen ol)
+# 7. Masha knappane makes it stupid
