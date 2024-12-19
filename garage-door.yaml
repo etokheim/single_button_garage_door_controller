@@ -9,7 +9,7 @@ esp32:
 
 # Enable logging
 logger:
-  level: VERBOSE
+  level: DEBUG
 
 # Enable Home Assistant API
 api:
@@ -50,6 +50,76 @@ button:
             current_operation: IDLE
         - lambda: 'id(door_state) = 0;' # Closed
 
+# Monitor any hardwired buttons which controls the garage door
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO26 
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Hardwired Door Button"
+    id: hardwired_door_button
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(is_processing) == false;'
+            then:
+              - logger.log:
+                  format: "Hardwired button being pressed"
+                  tag: garage_door
+                  level: WARN
+    on_release:
+      then:
+        - logger.log:
+            format: "Hardwired button released"
+            tag: garage_door
+            level: WARN
+    filters:
+      - delayed_on: !lambda 'return id(garage_button_press_threshold).state;' # Only register as 'pressed' if held for more than 200ms
+
+number:
+  - platform: template
+    name: "Close Time"
+    icon: mdi:arrow-down
+    id: garage_door_close_time
+    min_value: 5.0
+    max_value: 30.0
+    step: 0.1
+    unit_of_measurement: "s"
+    initial_value: 20.0
+    optimistic: true
+  - platform: template
+    name: "Open Time"
+    icon: mdi:arrow-up
+    id: garage_door_open_time
+    min_value: 5.0
+    max_value: 30.0
+    step: 0.1
+    unit_of_measurement: "s"
+    initial_value: 15.5
+    optimistic: true
+  - platform: template
+    name: "Button press threshold" # How long a press must be in order to be registered by the garage door opener. (Used to keep track of valid manual user input).
+    icon: mdi:timer-outline
+    id: garage_button_press_threshold
+    min_value: 50
+    max_value: 1000
+    step: 50
+    unit_of_measurement: "ms"
+    initial_value: 400
+    optimistic: true
+  - platform: template
+    name: "Button press duration" # How long the controller should press the garage door opener before releasing it
+    icon: mdi:gesture-tap-button
+    id: garage_button_press_duration
+    min_value: 50
+    max_value: 1000
+    step: 50
+    unit_of_measurement: "ms"
+    initial_value: 500
+    optimistic: true
+
 globals:
   - id: door_state
     type: int
@@ -67,14 +137,6 @@ globals:
     type: float
     restore_value: true
     initial_value: '0.0'  # Position in percentage (0.0 to 100.0)
-  - id: garage_door_close_time
-    type: float
-    restore_value: true
-    initial_value: '15.5' # The time it takes for the door to move from fully open to the closed
-  - id: garage_door_open_time
-    type: float
-    restore_value: true
-    initial_value: '20.0' # The time it takes for the door to move from fully closed to the open
   - id: garage_door_button_press_duration
     type: int
     restore_value: true
@@ -83,8 +145,73 @@ globals:
     type: float
     restore_value: true
     initial_value: '0.0' # For how long the button should be pressed
+  - id: action_queue
+    type: 'std::queue<std::string>'
+  - id: next_action
+    type: std::string
+  - id: is_processing
+    type: bool
+    initial_value: 'false'
 
 script:
+  # We need to queue the actions sequentially, so that mashing the buttons doesn't mess everything up
+  - id: process_queue
+    mode: queued
+    then:
+      - while:
+          condition:
+            lambda: 'return !id(action_queue).empty();'
+          then:
+            - lambda: |-
+                // Can't get loglevel, so we have to manually change this 
+                if (true) {
+                  ESP_LOGD("queue", "Current action queue:");
+                  std::queue<std::string> temp_queue = id(action_queue); // Copy the queue to iterate
+                  while (!temp_queue.empty()) {
+                    ESP_LOGD("queue", "  - %s", temp_queue.front().c_str());
+                    temp_queue.pop();
+                  }
+                }
+                
+                // Dequeue the next action
+                id(next_action) = id(action_queue).front();
+                id(action_queue).pop();
+
+                ESP_LOGD("garage_door", "Starting for loop");
+
+            - if:
+                condition:
+                  lambda: 'return id(next_action) == "move_up";'
+                then:
+                  - script.execute: move_up
+                  - script.wait: move_up
+
+            - if:
+                condition:
+                  lambda: 'return id(next_action) == "move_down";'
+                then:
+                  - script.execute: move_down
+                  - script.wait: move_down
+
+            - if:
+                condition:
+                  lambda: 'return id(next_action) == "move_to";'
+                then:
+                  - script.execute: move_to
+                  - script.wait: move_to
+                    
+            - if:
+                condition:
+                  lambda: 'return id(next_action) == "stop";'
+                then:
+                  - script.execute: stop
+                  - script.wait: stop
+                
+            - lambda: 'id(is_processing) = false;'
+
+            # Wait a little, so that a button press from the processed script doesn't intefere with a press from the next script
+            - delay: !lambda 'return id(garage_door_button_press_duration);'
+
   - id: push_button
     mode: queued
     then:
@@ -259,36 +386,77 @@ script:
 
                         - lambda: 'id(door_state) = 3;' # Closing
 
+  - id: move_to
+    mode: queued
+    then:
+      # If we should go up
+      - if:
+          condition:
+            lambda: 'return id(desired_position) > id(door_position);'
+          then:
+            - script.execute: move_up
+            - script.wait: move_up
+          
+          else:
+            # Else, if we should go down
+            - if:
+                condition:
+                  lambda: 'return id(desired_position) < id(door_position);'
+                then:
+                  - script.execute: move_down
+                  - script.wait: move_down
+
+  - id: stop
+    mode: queued
+    then:
+      - if:
+          condition:
+            lambda: 'return id(door_state) == 2 || id(door_state) == 3; // Opening or closing'
+          then:
+            - script.execute: push_button
+            - script.wait: push_button
+            - lambda: |-
+                // If it was opening, set next_direction to closing, else the opposite
+                if (id(door_state) == 2) { // Opening
+                  id(next_direction) = 3; // Closing
+                } else if (id(door_state) == 3) { // Closing
+                  id(next_direction) = 2; // Opening
+                }
+                
+                id(door_state) = 4;
+
+            # Publish the new operation
+            - cover.template.publish: 
+                id: garage_door
+                position: !lambda 'return id(door_position) / 100.0;'
+                current_operation: IDLE
+
 interval:
   - interval: 250ms
     then:
       - if:
           condition:
-            # Only publish new state every second if the door is moving
+            # Only publish new state if the door is moving
             lambda: 'return id(door_state) == 2 || id(door_state) == 3;'
           then:
             - lambda: |-
                 int direction = (id(door_state) == 2) ? 1 : (id(door_state) == 3) ? -1 : 0;
-                ESP_LOGD("debug", "direction: %d (1: opening, -1: closing)", direction);
 
                 // Throw an error if the direction is 0 (shouldn't be possible)
                 if (abs(direction) == 0) {
-                  ESP_LOGE("garage_door", "Invalid door_state: %d. Expected 2 (opening) or 3 (closing).", id(door_state));
+                  ESP_LOGE("garage_door", "Invalid door_state: %d. Expected 1 (opening) or -1 (closing).", id(door_state));
                   return;
                 }
 
                 // Add/subtract as many percent as the door moves in a n-time to the position
-                if (direction == 1) { // Opening
+                if (direction == 1) { // Closing
                   //                                                         1s   / interval time
-                  id(door_position) += 100.0 / id(garage_door_open_time) / (1000 / 250) * direction;
-                } else { // Closing
-                  id(door_position) += 100.0 / id(garage_door_close_time) / (1000 / 250) * direction;
+                  id(door_position) += 100.0 / id(garage_door_open_time).state / (1000 / 250) * direction;
+                } else { // Opening
+                  id(door_position) += 100.0 / id(garage_door_close_time).state / (1000 / 250) * direction;
                 }
                 
-                ESP_LOGD("debug", "Desired position: %f", id(desired_position));
-                ESP_LOGD("debug", "Direction: %d", direction);
-                ESP_LOGD("debug", "Door position: %f", id(door_position));
-                ESP_LOGD("debug", "Start position: %f", id(start_position));
+                ESP_LOGD("debug", "direction: %d, desired_position: %f, start_position: %f, door_position: %f", direction, id(desired_position), id(start_position), id(door_position));
 
                 // If opening
                 // and we're ultimately going in the opening direction (if the door has to turn, it has to briefly go in the wrong direction)
@@ -340,65 +508,53 @@ cover:
   - platform: template
     name: "Garage Door"
     id: garage_door
+    device_class: garage
     optimistic: false
     has_position: true
     position_action:
-      - lambda:  |-
-          id(desired_position) = pos * 100;
-          ESP_LOGD("debug", "Desired position: %f", id(desired_position));
+      - lambda: 'id(desired_position) = pos * 100;'
+      - lambda: |-
+          id(action_queue).push("move_to");
 
-      # If we should go up
-      - if:
-          condition:
-            lambda: 'return id(desired_position) > id(door_position);'
-          then:
-            - script.execute: move_up
-            - script.wait: move_up
-          
-          else:
-            # Else, if we should go down
-            - if:
-                condition:
-                  lambda: 'return id(desired_position) < id(door_position);'
-                then:
-                  - script.execute: move_down
-                  - script.wait: move_down
-
+          // Start processing the queue if not already running
+          if (!id(is_processing)) {
+            id(is_processing) = true;
+            id(process_queue).execute();
+          }
 
     open_action:
       - lambda: 'id(desired_position) = 100.0;'
-      - script.execute: move_up
-      
+      - lambda: |-
+          id(action_queue).push("move_up");
+
+          // Start processing the queue if not already running
+          if (!id(is_processing)) {
+            id(is_processing) = true;
+            id(process_queue).execute();
+          }
 
     close_action:
       - lambda: 'id(desired_position) = 0.0;'
-      - script.execute: move_down
+      - lambda: |-
+          id(action_queue).push("move_down");
+
+          // Start processing the queue if not already running
+          if (!id(is_processing)) {
+            id(is_processing) = true;
+            id(process_queue).execute();
+          }
 
     stop_action:
-      - if:
-          condition:
-            lambda: 'return id(door_state) == 2 || id(door_state) == 3; // Opening or closing'
-          then:
-            - script.execute: push_button
-            - script.wait: push_button
-            - lambda: |-
-                // If it was opening, set next_direction to closing, else the opposite
-                if (id(door_state) == 2) { // Opening
-                  id(next_direction) = 3; // Closing
-                } else if (id(door_state) == 3) { // Closing
-                  id(next_direction) = 2; // Opening
-                }
-                
-                id(door_state) = 4;
+      - lambda: |-
+          id(action_queue).push("stop");
 
-            # Publish the new operation
-            - cover.template.publish: 
-                id: garage_door
-                position: !lambda 'return id(door_position) / 100.0;'
-                current_operation: IDLE
+          // Start processing the queue if not already running
+          if (!id(is_processing)) {
+            id(is_processing) = true;
+            id(process_queue).execute();
+          }
 
 
 # TODO:
 # 3. Det er av og til den 'publishing position: 0%', sjølv om den før og etter seier at den er rundt td. 60%. Det er også ein del tilfeller der den seier 'setting: 0%', men det er kanskje meininga
 # 6. Overvåk manuell user-input (bruk av brytaren på veggen ol)
-# 7. Masha knappane makes it stupid
