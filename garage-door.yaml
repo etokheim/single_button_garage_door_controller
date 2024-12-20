@@ -68,7 +68,7 @@ binary_sensor:
               - logger.log:
                   format: "Hardwired button being pressed"
                   tag: garage_door
-                  level: WARN
+                  level: INFO
 
     on_release:
       then:
@@ -79,7 +79,7 @@ binary_sensor:
               - logger.log:
                   format: "Hardwired button being released"
                   tag: garage_door
-                  level: WARN
+                  level: INFO
 
               - script.execute: button_pushed_manually
 
@@ -304,11 +304,15 @@ script:
                 then:
                   - script.execute: stop
                   - script.wait: stop
-                
-            - lambda: 'id(is_processing) = false;'
 
             # Wait a little, so that a button press from the processed script doesn't intefere with a press from the next script
             - delay: !lambda 'return id(garage_door_button_press_duration);'
+            
+            - if:
+                condition:
+                  - lambda: 'return id(action_queue).empty();'
+                then:
+                  - lambda: 'id(is_processing) = false;'
 
   - id: push_button
     mode: queued
@@ -651,8 +655,3 @@ cover:
             id(is_processing) = true;
             id(process_queue).execute();
           }
-
-
-# TODO:
-# 3. Det er av og til den 'publishing position: 0%', sjølv om den før og etter seier at den er rundt td. 60%. Det er også ein del tilfeller der den seier 'setting: 0%', men det er kanskje meininga
-# 11. The hardwired button is triggered by the software button in some scenarios... maybe add a grace period
