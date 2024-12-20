@@ -141,6 +141,8 @@ globals:
     type: int
     restore_value: true
     initial_value: '-1'  # -1: Unknown, 2: Opening, 3: Closing
+  - id: actual_direction
+    type: CoverOperation
   - id: door_position
     type: float
     restore_value: true
@@ -563,6 +565,8 @@ interval:
                 // If opening
                 // and we're ultimately going in the opening direction (if the door has to turn, it has to briefly go in the wrong direction)
                 if (direction == 1 && id(start_position) <= id(desired_position)) {
+                  id(actual_direction) = CoverOperation::COVER_OPERATION_OPENING;
+
                   // Keep going until door_position is higher than the desired position.
                   // Also, don't do anything if the desired_position is 100 (the door stops automatically when reaching the end)
                   if (id(door_position) >= id(desired_position) && id(desired_position) < 100) {
@@ -574,6 +578,8 @@ interval:
                     ESP_LOGD("debug", "While opening, the door reached the desired position (%f) and stopped at %f. Start position: %f", id(desired_position), id(door_position), id(start_position));
                   }
                 } else if (direction == -1 && id(start_position) >= id(desired_position)) { // Closing
+                  id(actual_direction) = CoverOperation::COVER_OPERATION_CLOSING;
+
                   if (id(door_position) <= id(desired_position) && id(desired_position) > 0) {
                     id(door_state) = 4;         // Stop moving and set to intermediate (If fully open/closed the state is fixed below)
                     id(push_button)->execute();
@@ -588,23 +594,18 @@ interval:
                 if (id(door_position) >= 100.0) {
                   id(door_position) = 100.0;  // Fully open
                   id(door_state) = 1;         // Mark as open
+                  id(actual_direction) = CoverOperation::COVER_OPERATION_IDLE;
                 } else if (id(door_position) <= 0.0) {
                   id(door_position) = 0.0;    // Fully closed
                   id(door_state) = 0;         // Mark as closed
+                  id(actual_direction) = CoverOperation::COVER_OPERATION_IDLE;
                 }
 
             # Publish the new position
             - cover.template.publish:
                 id: garage_door
                 position: !lambda 'return id(door_position) / 100.0;'
-                current_operation: !lambda |-
-                  if (id(door_state) == 2) {
-                    return CoverOperation::COVER_OPERATION_OPENING;
-                  } else if (id(door_state) == 3) {
-                    return CoverOperation::COVER_OPERATION_CLOSING;
-                  } else {
-                    return CoverOperation::COVER_OPERATION_IDLE;
-                  }
+                current_operation: !lambda 'return id(actual_direction);'
 
 cover:
   - platform: template
@@ -655,3 +656,7 @@ cover:
             id(is_processing) = true;
             id(process_queue).execute();
           }
+
+
+# TODO:
+# 3. Det er av og til den 'publishing position: 0%', sjølv om den før og etter seier at den er rundt td. 60%. Det er også ein del tilfeller der den seier 'setting: 0%', men det er kanskje meininga
